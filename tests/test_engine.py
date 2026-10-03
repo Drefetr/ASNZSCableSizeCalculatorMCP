@@ -111,6 +111,36 @@ def test_current_capacity_uses_unrounded_derating(monkeypatch):
     assert selected["recommended_active_size_mm2"] == 16
 
 
+def _load_uniform_current_ratings(tmp_path, capacity):
+    """Load finite artificial ratings through the same validation as operator data."""
+    dataset = make_dataset()
+    for material in dataset["tables"]["CURRENT_RATINGS"].values():
+        for insulation in material.values():
+            for method in insulation.values():
+                for size in method:
+                    method[size] = capacity
+    path = tmp_path / "uniform-current-ratings.json"
+    path.write_text(json.dumps(dataset, allow_nan=False), encoding="utf-8")
+    tables.load_dataset(path)
+
+
+def test_accepted_finite_ratings_cannot_return_an_infinite_capacity_margin(tmp_path):
+    _load_uniform_current_ratings(tmp_path, 1e307)
+    assert tables.CURRENT_RATINGS["copper"]["V90"]["in_conduit_in_air"][1.5] == 1e307
+    with pytest.raises(ValueError, match="Capacity margin exceeds the supported numerical range"):
+        size_cable(1, 1)
+
+
+def test_large_finite_capacity_margin_remains_strict_json_serializable(tmp_path):
+    _load_uniform_current_ratings(tmp_path, 1e100)
+    result = size_cable(1, 1)
+    decoded = json.loads(json.dumps(result, allow_nan=False))
+    assert decoded["status"] == "success"
+    assert decoded["recommended_active_size_mm2"] == 1.5
+    assert decoded["capacity_margin_pct"] == pytest.approx(1e102)
+    assert math.isfinite(decoded["capacity_margin_pct"])
+
+
 @pytest.mark.parametrize("kwargs", [
     {"length_m": -10}, {"length_m": 0}, {"load_amps": -1}, {"voltage": math.inf},
     {"power_factor": -0.1}, {"power_factor": math.nan}, {"phase": "typo"}, {"phase": "dc"},

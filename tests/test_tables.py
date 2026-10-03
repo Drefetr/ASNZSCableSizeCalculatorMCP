@@ -263,6 +263,50 @@ def test_duplicate_json_key_rejected(tmp_path):
         tables.load_dataset(path)
 
 
+def _deeply_nested_json():
+    return '{"schema_version":1,"metadata":' + "[" * 5000 + "0" + "]" * 5000 + ',"tables":{}}'
+
+
+def test_excessively_nested_json_preserves_loaded_dataset(tmp_path):
+    path = tmp_path / "deeply-nested.json"
+    path.write_text(_deeply_nested_json(), encoding="utf-8")
+    before = {name: copy.deepcopy(getattr(tables, name)) for name in tables._TABLE_NAMES}
+    provenance = copy.deepcopy(tables.DATA_PROVENANCE)
+    data_error = tables._DATA_ERROR
+
+    with pytest.raises(ValueError, match="CABLESIZE_DATA_FILE JSON is nested too deeply"):
+        tables.load_dataset(path)
+
+    assert {name: getattr(tables, name) for name in tables._TABLE_NAMES} == before
+    assert tables.DATA_PROVENANCE == provenance
+    assert tables._DATA_ERROR == data_error
+    tables.require_dataset()
+
+
+def test_excessively_nested_override_startup_rejects_without_bundled_fallback(tmp_path):
+    path = tmp_path / "deeply-nested.json"
+    path.write_text(_deeply_nested_json(), encoding="utf-8")
+    env = os.environ.copy()
+    env["CABLESIZE_DATA_FILE"] = str(path)
+    code = """
+from cablesizecalculator import tables
+from cablesizecalculator.server import get_standards_info
+from cablesizecalculator.engine import size_cable
+info = get_standards_info()
+assert info['data_provenance']['configured'] is False
+assert info['data_provenance']['validation_status'] == 'invalid_configuration'
+assert all(not getattr(tables, name) for name in tables._TABLE_NAMES)
+try:
+    size_cable(10, 10)
+except ValueError as error:
+    assert 'CABLESIZE_DATA_FILE JSON is nested too deeply' in str(error)
+else:
+    raise AssertionError('Excessively nested override produced a cable recommendation')
+"""
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+
 def test_override_load_preserves_imported_table_references(tmp_path):
     reference = tables.RESISTANCE_TABLE
     original = make_dataset()

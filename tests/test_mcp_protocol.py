@@ -6,6 +6,7 @@ import os
 import sys
 from typing import Any
 
+import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -232,22 +233,74 @@ def test_stdio_flat_profiles_select_only_matching_exposure_and_report_basis(tmp_
     asyncio.run(check_profiles())
 
 
-def test_stdio_missing_dataset_override_fails_without_using_bundled_data(tmp_path):
-    async def check_missing_override():
+@pytest.mark.parametrize("configuration", ["missing", "deeply_nested"])
+def test_stdio_invalid_dataset_override_fails_without_using_bundled_data(tmp_path, configuration):
+    dataset_path = tmp_path / "invalid.json"
+    if configuration == "deeply_nested":
+        dataset_path.write_text(
+            '{"schema_version":1,"metadata":' + "[" * 5000 + "0" + "]" * 5000 + ',"tables":{}}',
+            encoding="utf-8",
+        )
+
+    async def check_invalid_override():
         server_params = StdioServerParameters(
             command=sys.executable,
             args=["-m", "cablesizecalculator.server"],
-            env={"CABLESIZE_DATA_FILE": str(tmp_path / "missing.json")},
+            env={"CABLESIZE_DATA_FILE": str(dataset_path)},
         )
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 info = _json_result(await session.call_tool("get_standards_info", {}))
                 assert info["data_provenance"]["configured"] is False
+                assert info["data_provenance"]["validation_status"] == "invalid_configuration"
                 response = await session.call_tool("size_cable", {"load": 10, "length_m": 5})
                 assert response.is_error
                 message = " ".join(block.text for block in response.content if hasattr(block, "text"))
                 assert "CABLESIZE_DATA_FILE" in message
                 assert str(tmp_path) not in message
+                if configuration == "deeply_nested":
+                    assert "nested too deeply" in message.lower()
 
-    asyncio.run(check_missing_override())
+    async def bounded_check():
+        async with asyncio.timeout(20):
+            await check_invalid_override()
+
+    asyncio.run(bounded_check())
+
+
+def test_stdio_capacity_margin_overflow_returns_actionable_error(tmp_path):
+    dataset = make_dataset()
+    dataset["metadata"]["dataset_id"] = "synthetic-finite-rating-overflow"
+    for material in dataset["tables"]["CURRENT_RATINGS"].values():
+        for insulation in material.values():
+            for ratings in insulation.values():
+                for size in ratings:
+                    ratings[size] = 1e307
+    dataset_path = tmp_path / "finite-extreme-ratings.json"
+    dataset_path.write_text(json.dumps(dataset, allow_nan=False), encoding="utf-8")
+
+    async def check_overflow():
+        server_params = StdioServerParameters(
+            command=sys.executable, args=["-m", "cablesizecalculator.server"],
+            env={"CABLESIZE_DATA_FILE": str(dataset_path)},
+        )
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                for tool in ("size_cable", "generate_calculation_report"):
+                    response = await session.call_tool(tool, {"load": 1, "length_m": 1})
+                    assert response.is_error, f"{tool} returned a non-finite result"
+                    message = " ".join(block.text for block in response.content if hasattr(block, "text"))
+                    assert "Capacity margin" in message
+                    assert "supported numerical range" in message
+                    json.dumps(response.model_dump(mode="json"), allow_nan=False)
+                info = _json_result(await session.call_tool("get_standards_info", {}))
+                assert info["data_provenance"]["configured"] is True
+                assert info["data_provenance"]["dataset_id"] == dataset["metadata"]["dataset_id"]
+
+    async def bounded_check():
+        async with asyncio.timeout(20):
+            await check_overflow()
+
+    asyncio.run(bounded_check())

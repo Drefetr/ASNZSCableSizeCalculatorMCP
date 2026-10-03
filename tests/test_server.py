@@ -1,6 +1,7 @@
 """Server and report regressions using independently invented test data."""
 
 import asyncio
+from copy import deepcopy
 from unittest.mock import Mock
 
 import pytest
@@ -41,6 +42,25 @@ def test_metadata_identifies_model_and_avoids_table_redistribution():
     assert "copper_sizes_mm2" not in info
     assert "aluminium_sizes_mm2" not in info
     assert info["current_rating_profiles"] == []
+
+
+def test_metadata_snapshot_cannot_change_later_default_calculations(monkeypatch):
+    # Isolate global configuration even if the regression fails before mutation checks.
+    original_provenance = deepcopy(tables.DATA_PROVENANCE)
+    monkeypatch.setattr(tables, "DATA_PROVENANCE", deepcopy(original_provenance))
+    monkeypatch.setattr(server, "DATA_PROVENANCE", tables.DATA_PROVENANCE)
+    original_derating = calculate_derating()
+    original_info = deepcopy(get_standards_info())
+    returned_provenance = get_standards_info()["data_provenance"]
+    assert returned_provenance["assumptions"] is not tables.DATA_PROVENANCE["assumptions"]
+    assert returned_provenance["standard_editions"] is not tables.DATA_PROVENANCE["standard_editions"]
+
+    returned_provenance["assumptions"]["reference_air_temp_c"] += 5
+    returned_provenance["standard_editions"].append("Caller-only annotation")
+
+    assert tables.DATA_PROVENANCE == original_provenance
+    assert get_standards_info() == original_info
+    assert calculate_derating() == original_derating
 
 
 @pytest.fixture

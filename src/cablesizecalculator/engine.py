@@ -7,9 +7,88 @@ from __future__ import annotations
 
 import math
 from copy import deepcopy
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal, TypedDict
 
 from cablesizecalculator import tables, validation as validate
+
+
+class CandidateSummary(TypedDict):
+    size_mm2: float
+    earth_size_mm2: float | None
+    paired_earth_size_mm2: float | None
+    earth_pairing_ok: bool
+    earth_pairing_error: str | None
+    base_capacity_a: float
+    derated_capacity_a: float
+    derated_capacity_a_raw: float
+    current_ok: bool
+    voltage_drop_v: float
+    voltage_drop_pct: float
+    voltage_drop_pct_raw: float
+    voltage_drop_ok: bool
+    short_circuit_ok: bool | None
+    earth_short_circuit_ok: bool | None
+    pass_earth_short_circuit: bool | None
+    pass_loop_impedance: bool | None
+    loop_impedance_ok: bool | None
+    failed_constraints: list[str]
+    compliant: bool
+
+
+class SizingResult(TypedDict):
+    status: Literal["success", "failed"]
+    message: str | None
+    recommended_active_size_mm2: float | None
+    recommended_earth_size_mm2: float | None
+    earth_conductor_material: str
+    limiting_factor: str | None
+    design_current_ib_a: float
+    required_rating_a: float
+    cable_continuous_capacity_iz_a: float | None
+    capacity_margin_pct: float | None
+    voltage_drop_v: float | None
+    voltage_drop_pct: float | None
+    voltage_drop_pct_raw: float | None
+    voltage_drop_limit_pct: float
+    derating: dict[str, Any]
+    loop_impedance_check: dict[str, Any] | None
+    short_circuit_check: dict[str, Any] | None
+    earth_short_circuit_check: dict[str, Any] | None
+    check_states: dict[str, str]
+    inputs: dict[str, Any]
+    assumptions: list[str]
+    all_candidates: list[CandidateSummary]
+    data_provenance: dict[str, Any]
+    rating_basis: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _SizingConditions:
+    """Validated values shared by every candidate in one sizing calculation."""
+
+    design_current_a: float
+    required_rating_a: float
+    derating_factor: float
+    length_m: float
+    voltage: float
+    phase: str
+    power_factor: float
+    material: str
+    earth_material: str
+    insulation: str
+    voltage_drop_limit_pct: float
+    mcb_rating_a: float | None
+    mcb_curve: str
+    supply_loop_impedance_ohm: float
+    check_fault: bool
+    fault_current_ka: float
+    fault_time_s: float
+    earth_fault_current_ka: float
+    earth_fault_time_s: float
+
+
+_CandidateChecks = tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]
 
 
 def _provenance() -> dict[str, Any]:
@@ -280,6 +359,7 @@ def _earth_size(active_size: float, active_material: str, earth_material: str, i
     No fixed conductivity ratio or interpolation is invented.
     """
     copper = _lookup(_lookup(tables.RESISTANCE_TABLE, "copper", "Material"), insulation, "Insulation")
+    equivalent: float | None
     if active_material == "copper":
         equivalent = active_size
     else:
@@ -300,6 +380,97 @@ def _earth_size(active_size: float, active_material: str, earth_material: str, i
     return earth_size
 
 
+def _evaluate_candidate(
+    size: float, base_capacity: float, conditions: _SizingConditions,
+) -> tuple[CandidateSummary, _CandidateChecks]:
+    """Evaluate one active size, including its pairing and independent earth upsize."""
+    capacity = validate.finite_result(base_capacity * conditions.derating_factor, "Derated current capacity")
+    current_ok = capacity >= conditions.required_rating_a
+    vd = calculate_voltage_drop(
+        size, conditions.design_current_a, conditions.length_m, conditions.voltage,
+        conditions.phase, conditions.material, conditions.insulation, conditions.power_factor,
+    )
+    vd_ok = vd["voltage_drop_pct_raw"] <= conditions.voltage_drop_limit_pct
+    pairing_error = None
+    earth_size: float | None
+    paired_earth: float | None
+    try:
+        earth_size = paired_earth = _earth_size(
+            size, conditions.material, conditions.earth_material, conditions.insulation,
+        )
+    except _EarthPairingUnavailable as error:
+        earth_size = paired_earth = None
+        pairing_error = str(error)
+    pairing_ok = paired_earth is not None
+    active_sc: dict[str, Any] | None = None
+    earth_sc: dict[str, Any] | None = None
+    if conditions.check_fault:
+        active_sc = check_short_circuit_capacity(
+            size, conditions.fault_current_ka, conditions.fault_time_s,
+            conditions.material, conditions.insulation,
+        )
+    if conditions.check_fault and paired_earth is not None:
+        earth_sizes = _lookup(
+            _lookup(tables.RESISTANCE_TABLE, conditions.earth_material, "Earth material"),
+            conditions.insulation, "Earth insulation",
+        )
+        for earth_candidate in sorted(s for s in earth_sizes if s >= paired_earth):
+            earth_size = earth_candidate
+            earth_sc = check_short_circuit_capacity(
+                earth_size, conditions.earth_fault_current_ka, conditions.earth_fault_time_s,
+                conditions.earth_material, conditions.insulation,
+            )
+            if earth_sc["compliant"]:
+                break
+    sc_ok = None if active_sc is None else active_sc["compliant"]
+    earth_sc_ok = None if earth_sc is None else earth_sc["compliant"]
+    loop: dict[str, Any] | None = None
+    if conditions.mcb_rating_a is not None and earth_size is not None:
+        phase_voltage = conditions.voltage / math.sqrt(3) if conditions.phase == "3phase" else conditions.voltage
+        loop = check_loop_impedance(
+            size, earth_size, conditions.mcb_rating_a, conditions.mcb_curve, phase_voltage,
+            conditions.material, conditions.insulation, conditions.earth_material,
+            conditions.length_m, conditions.supply_loop_impedance_ohm,
+        )
+    loop_ok = None if loop is None else loop["compliant"]
+    failed = [name for name, passed in (
+        ("current_capacity", current_ok), ("voltage_drop", vd_ok), ("earth_pairing", pairing_ok),
+        ("short_circuit", sc_ok), ("earth_short_circuit", earth_sc_ok), ("loop_impedance", loop_ok),
+    ) if passed is False]
+    summary: CandidateSummary = {
+        "size_mm2": size, "earth_size_mm2": earth_size, "paired_earth_size_mm2": paired_earth,
+        "earth_pairing_ok": pairing_ok, "earth_pairing_error": pairing_error,
+        "base_capacity_a": base_capacity, "derated_capacity_a": round(capacity, 1), "derated_capacity_a_raw": capacity,
+        "current_ok": current_ok, "voltage_drop_v": vd["voltage_drop_v"], "voltage_drop_pct": vd["voltage_drop_pct"],
+        "voltage_drop_pct_raw": vd["voltage_drop_pct_raw"], "voltage_drop_ok": vd_ok,
+        "short_circuit_ok": sc_ok, "earth_short_circuit_ok": earth_sc_ok,
+        "pass_earth_short_circuit": earth_sc_ok, "pass_loop_impedance": loop_ok,
+        "loop_impedance_ok": loop_ok, "failed_constraints": failed, "compliant": not failed,
+    }
+    return summary, (loop, active_sc, earth_sc)
+
+
+def _limiting_constraint(selected: CandidateSummary, evaluations: list[CandidateSummary]) -> str:
+    """Identify the final active-size constraint, or a selected earth thermal upsize."""
+    chosen = selected["size_mm2"]
+    first_current = next(candidate for candidate in evaluations if candidate["current_ok"])
+    drivers = set()
+    if chosen > first_current["size_mm2"]:
+        # Earlier failures can cease to bind before the final active size. The
+        # preceding viable-current candidate identifies what forced that upsize.
+        preceding = max((candidate for candidate in evaluations
+                         if candidate["current_ok"] and candidate["size_mm2"] < chosen),
+                        key=lambda candidate: candidate["size_mm2"])
+        drivers.update(preceding["failed_constraints"])
+    earth_size, paired_earth = selected["earth_size_mm2"], selected["paired_earth_size_mm2"]
+    if not drivers and earth_size is not None and paired_earth is not None and earth_size > paired_earth:
+        drivers.add("short_circuit")
+    if "earth_short_circuit" in drivers:
+        drivers.add("short_circuit")
+    return next((name for name in ("loop_impedance", "short_circuit", "voltage_drop", "earth_pairing")
+                 if name in drivers), "current_capacity")
+
+
 def size_cable(
     load: float, length_m: float, unit: str = "A", voltage: float = 400.0,
     phase: str = "3phase", power_factor: float = 0.85, conductor_material: str = "copper",
@@ -310,7 +481,7 @@ def size_cable(
     earth_conductor_material: str = "copper", earth_fault_current_ka: float | None = None,
     earth_fault_time_s: float | None = None, supply_loop_impedance_ohm: float = 0.0,
     cable_construction: str = "generic", insulation_exposure: str | None = None,
-) -> dict[str, Any]:
+) -> SizingResult:
     """Select the smallest active size passing all requested calculations.
 
     Each candidate's earth conductor begins at the configured pairing and is
@@ -348,61 +519,28 @@ def size_cable(
         material, insulation, method, phase, construction, insulation_exposure,
     )
     derating = get_derating_factor(ambient_temp_c, method, num_circuits, depth_m, insulation)
-    factor = derating["total_derating_factor_raw"]
     sizes = sorted(ratings)
     if not sizes:
         raise ValueError("No conductor sizes are configured.")
     required = ib if rating is None else rating
-    evaluations, details = [], {}
-    selected = None
-    for size in sorted(sizes):
+    conditions = _SizingConditions(
+        design_current_a=ib, required_rating_a=required,
+        derating_factor=derating["total_derating_factor_raw"], length_m=length,
+        voltage=voltage, phase=phase, power_factor=pf, material=material,
+        earth_material=earth_material, insulation=insulation, voltage_drop_limit_pct=limit,
+        mcb_rating_a=rating, mcb_curve=curve, supply_loop_impedance_ohm=source,
+        check_fault=fault, fault_current_ka=fault_current, fault_time_s=fault_time,
+        earth_fault_current_ka=earth_current, earth_fault_time_s=earth_time,
+    )
+    evaluations: list[CandidateSummary] = []
+    details: dict[float, _CandidateChecks] = {}
+    selected: CandidateSummary | None = None
+    for size in sizes:
         base = _lookup(ratings, size, "Current rating for conductor size")
-        capacity = validate.finite_result(base * factor, "Derated current capacity")
-        current_ok = capacity >= required
-        vd = calculate_voltage_drop(size, ib, length, voltage, phase, material, insulation, pf)
-        vd_ok = vd["voltage_drop_pct_raw"] <= limit
-        pairing_error = None
-        try:
-            earth_size = paired_earth = _earth_size(size, material, earth_material, insulation)
-        except _EarthPairingUnavailable as error:
-            earth_size = paired_earth = None
-            pairing_error = str(error)
-        pairing_ok = paired_earth is not None
-        active_sc = earth_sc = None
-        if fault:
-            active_sc = check_short_circuit_capacity(size, fault_current, fault_time, material, insulation)
-        if fault and pairing_ok:
-            earth_sizes = _lookup(_lookup(tables.RESISTANCE_TABLE, earth_material, "Earth material"), insulation, "Earth insulation")
-            for earth_candidate in sorted(s for s in earth_sizes if s >= paired_earth):
-                earth_size = earth_candidate
-                earth_sc = check_short_circuit_capacity(earth_size, earth_current, earth_time, earth_material, insulation)
-                if earth_sc["compliant"]:
-                    break
-        sc_ok = None if active_sc is None else active_sc["compliant"]
-        earth_sc_ok = None if earth_sc is None else earth_sc["compliant"]
-        loop = None if rating is None or not pairing_ok else check_loop_impedance(
-            size, earth_size, rating, curve, voltage / math.sqrt(3) if phase == "3phase" else voltage,
-            material, insulation, earth_material, length, source,
-        )
-        loop_ok = None if loop is None else loop["compliant"]
-        failed = [name for name, passed in (
-            ("current_capacity", current_ok), ("voltage_drop", vd_ok), ("earth_pairing", pairing_ok),
-            ("short_circuit", sc_ok),
-            ("earth_short_circuit", earth_sc_ok), ("loop_impedance", loop_ok),
-        ) if passed is False]
-        evaluation = {
-            "size_mm2": size, "earth_size_mm2": earth_size, "paired_earth_size_mm2": paired_earth,
-            "earth_pairing_ok": pairing_ok, "earth_pairing_error": pairing_error,
-            "base_capacity_a": base, "derated_capacity_a": round(capacity, 1), "derated_capacity_a_raw": capacity,
-            "current_ok": current_ok, "voltage_drop_v": vd["voltage_drop_v"], "voltage_drop_pct": vd["voltage_drop_pct"],
-            "voltage_drop_pct_raw": vd["voltage_drop_pct_raw"], "voltage_drop_ok": vd_ok,
-            "short_circuit_ok": sc_ok, "earth_short_circuit_ok": earth_sc_ok,
-            "pass_earth_short_circuit": earth_sc_ok, "pass_loop_impedance": loop_ok,
-            "loop_impedance_ok": loop_ok, "failed_constraints": failed, "compliant": not failed,
-        }
+        evaluation, checks = _evaluate_candidate(size, base, conditions)
         evaluations.append(evaluation)
-        details[size] = (loop, active_sc, earth_sc)
-        if selected is None and not failed:
+        details[size] = checks
+        if selected is None and evaluation["compliant"]:
             selected = evaluation
     states = {
         "current_capacity": "no_selection", "voltage_drop": "no_selection",
@@ -436,7 +574,7 @@ def size_cable(
         assumptions.append("The selected profile specifies current capacity; impedance, earth pairings and thermal withstand use the dataset's other configured tables.")
     else:
         assumptions.append("Legacy generic current ratings do not distinguish cable construction, loaded conductors or detailed insulation exposure.")
-    result = {
+    result: SizingResult = {
         "status": "failed" if selected is None else "success",
         "message": (
             "No configured cable size within the selected current-rating profile coverage satisfied all requested calculations."
@@ -456,29 +594,18 @@ def size_cable(
     if selected is None:
         return result
     chosen = selected["size_mm2"]
-    first_current = next(c for c in evaluations if c["current_ok"])
-    drivers = set()
-    if chosen > first_current["size_mm2"]:
-        # Earlier candidates may fail constraints that cease to bind before the
-        # selected size. The immediately preceding viable-current candidate
-        # identifies the checks which actually forced this final active upsize.
-        preceding = max((candidate for candidate in evaluations
-                         if candidate["current_ok"] and candidate["size_mm2"] < chosen),
-                        key=lambda candidate: candidate["size_mm2"])
-        drivers.update(preceding["failed_constraints"])
-    if not drivers and selected["earth_size_mm2"] > selected["paired_earth_size_mm2"]:
-        drivers.add("short_circuit")
-    if "earth_short_circuit" in drivers:
-        drivers.add("short_circuit")
-    primary = next((name for name in ("loop_impedance", "short_circuit", "voltage_drop", "earth_pairing") if name in drivers), "current_capacity")
     for name in states:
         if states[name] != "not_requested":
             states[name] = "passed"
     loop, active_sc, earth_sc = details[chosen]
+    margin = validate.finite_result(
+        (selected["derated_capacity_a_raw"] / required - 1) * 100, "Capacity margin",
+    )
     result.update({
         "recommended_active_size_mm2": chosen, "recommended_earth_size_mm2": selected["earth_size_mm2"],
-        "limiting_factor": primary, "cable_continuous_capacity_iz_a": selected["derated_capacity_a"],
-        "capacity_margin_pct": round((selected["derated_capacity_a_raw"] / required - 1) * 100, 1),
+        "limiting_factor": _limiting_constraint(selected, evaluations),
+        "cable_continuous_capacity_iz_a": selected["derated_capacity_a"],
+        "capacity_margin_pct": round(margin, 1),
         "voltage_drop_v": selected["voltage_drop_v"], "voltage_drop_pct": selected["voltage_drop_pct"],
         "voltage_drop_pct_raw": selected["voltage_drop_pct_raw"], "loop_impedance_check": loop,
         "short_circuit_check": active_sc, "earth_short_circuit_check": earth_sc,

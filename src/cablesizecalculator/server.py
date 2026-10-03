@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Annotated, Any, Callable, Literal
 
 from mcp.server.mcpserver import Context, MCPServer
@@ -258,11 +259,11 @@ def get_standards_info() -> dict[str, Any]:
     """Return model scope and provenance status, without reproducing reference tables."""
     # Return an explicit metadata allowlist so local paths or unrelated private fields
     # supplied in a private dataset do not escape through this information tool.
-    provenance = {
+    provenance = deepcopy({
         key: DATA_PROVENANCE[key]
         for key in ("configured", "dataset_id", "source", "licence", "standard_editions", "assumptions", "validation_status")
         if key in DATA_PROVENANCE
-    }
+    })
     return {
         "standard": "Historical references: AS/NZS 3008.1.1 and AS/NZS 3000; no edition certified",
         "model_status": "experimental; no standards-compliance certification",

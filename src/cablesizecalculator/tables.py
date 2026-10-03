@@ -307,6 +307,10 @@ def load_dataset(path: str | Path) -> None:
         tables, metadata = _validate(raw)
     except OSError:
         raise ValueError("Cannot read CABLESIZE_DATA_FILE; check the local file and access rights.") from None
+    except RecursionError:
+        raise ValueError(
+            "CABLESIZE_DATA_FILE JSON is nested too deeply; simplify its objects and arrays."
+        ) from None
     except (json.JSONDecodeError, UnicodeError):
         raise ValueError("CABLESIZE_DATA_FILE must contain UTF-8 JSON reference data.") from None
     for name, value in tables.items():
