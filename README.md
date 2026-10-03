@@ -10,6 +10,10 @@ The model supports single-phase and three-phase AC calculations, copper or alumi
 
 Sizing evaluates every candidate against current capacity and unrounded voltage drop. Optional breaker and fault inputs enable further checks. Results and reports identify which checks were performed or omitted. A successful selection means that the requested calculations passed under the supplied assumptions; it is not a declaration of standards compliance. Network fault impedance, breaker characteristics, actual clearing times, and reference-data applicability must be established for the installation.
 
+For single-phase copper V90 flat 2C+E cable, set `cable_construction="flat_2c_earth"`. With `installation_method="in_thermal_insulation"`, also set `insulation_exposure` to `"partially_surrounded"` or `"completely_surrounded"`. For the supplied 20 A, 20 m, 230 V comparison, these select 4 mm² and 6 mm² respectively. The unenclosed-in-air profile selects 2.5 mm².
+
+These profiles use the lower bounds of the supplied JCalc rating ranges and cover only the supplied sizes. Unsupported profile combinations are rejected, and sizing stays within the selected profile's coverage. The default `"generic"` construction uses the legacy ratings. Results identify the rating basis; profile selection changes current capacity, while the other checks use the dataset's impedance, earth-pairing and thermal tables.
+
 ## Setup
 
 Python 3.12 or later and [uv](https://docs.astral.sh/uv/) are required for the development setup:

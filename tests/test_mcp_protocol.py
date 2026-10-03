@@ -48,11 +48,21 @@ async def run_protocol_checks() -> dict[str, Any]:
             assert set(schema["conductor_material"]["enum"]) == {"copper", "aluminium"}
             assert "earth_fault_current_ka" in schema
             assert "supply_loop_impedance_ohm" in schema
+            assert set(schema["cable_construction"]["enum"]) == {"generic", "flat_2c_earth"}
+            exposure_schema = next(
+                option for option in schema["insulation_exposure"]["anyOf"] if "enum" in option
+            )
+            assert set(exposure_schema["enum"]) == {"none", "partially_surrounded", "completely_surrounded"}
+            report_schema = tools["generate_calculation_report"].input_schema["properties"]
+            assert report_schema["cable_construction"] == schema["cable_construction"]
+            assert report_schema["insulation_exposure"] == schema["insulation_exposure"]
 
             invalid_calls = [
                 ("size_cable", {"load": 10, "length_m": -1}),
                 ("size_cable", {"load": 10, "length_m": 5, "phase": "unknown"}),
                 ("size_cable", {"load": 10, "length_m": 5, "phase": "dc"}),
+                ("size_cable", {"load": 10, "length_m": 5, "cable_construction": "round"}),
+                ("size_cable", {"load": 10, "length_m": 5, "insulation_exposure": "fully_surrounded"}),
                 ("size_cable", {"load": 10, "length_m": 5, "num_circuits": 1.5}),
                 ("size_cable", {"load": True, "length_m": 5}),
                 ("size_cable", {"load": "Infinity", "length_m": 5}),
@@ -139,6 +149,87 @@ def test_stdio_mcp_schema_and_invalid_inputs():
     assert summary["configured"] is True
     assert summary["tool_count"] == 7
     assert summary["invalid_inputs_rejected"] >= 8
+
+
+def test_stdio_flat_profiles_select_only_matching_exposure_and_report_basis(tmp_path):
+    dataset = make_dataset()
+    dataset["schema_version"] = 2
+    dataset["metadata"]["dataset_id"] = "synthetic-stdio-flat-profiles"
+    common = {
+        "cable_construction": "flat_2c_earth", "conductor_material": "copper",
+        "insulation": "V90", "loaded_conductors": 2,
+        "installation_method": "in_thermal_insulation", "reference_temperature_c": 40.0,
+        "source": "Independent invented ratings for stdio profile tests.",
+    }
+    dataset["tables"]["CURRENT_RATING_PROFILES"] = {
+        "synthetic_stdio_partial": {
+            **common, "insulation_exposure": "partially_surrounded",
+            "ratings": {"2.5": 12.0, "4": 24.0, "6": 32.0},
+        },
+        "synthetic_stdio_complete": {
+            **common, "insulation_exposure": "completely_surrounded",
+            "ratings": {"2.5": 9.0, "4": 17.0, "6": 25.0},
+        },
+    }
+    dataset_path = tmp_path / "synthetic-profiles.json"
+    dataset_path.write_text(json.dumps(dataset), encoding="utf-8")
+
+    async def check_profiles():
+        server_params = StdioServerParameters(
+            command=sys.executable, args=["-m", "cablesizecalculator.server"],
+            env={"CABLESIZE_DATA_FILE": str(dataset_path)},
+        )
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                info = _json_result(await session.call_tool("get_standards_info", {}))
+                assert info["data_provenance"]["dataset_id"] == "synthetic-stdio-flat-profiles"
+                profiles = {profile["profile_id"]: profile for profile in info["current_rating_profiles"]}
+                assert set(profiles) == {"synthetic_stdio_partial", "synthetic_stdio_complete"}
+                assert profiles["synthetic_stdio_partial"]["supported_sizes_mm2"] == [2.5, 4.0, 6.0]
+                assert all("ratings" not in profile for profile in profiles.values())
+                arguments = {
+                    "load": 20.0, "length_m": 5.0, "voltage": 230.0, "phase": "1phase",
+                    "installation_method": "in_thermal_insulation", "cable_construction": "flat_2c_earth",
+                }
+                for exposure, expected_size, profile_id in (
+                    ("partially_surrounded", 4.0, "synthetic_stdio_partial"),
+                    ("completely_surrounded", 6.0, "synthetic_stdio_complete"),
+                ):
+                    request = {**arguments, "insulation_exposure": exposure}
+                    result = _json_result(await session.call_tool("size_cable", request))
+                    assert result["recommended_active_size_mm2"] == expected_size
+                    assert result["rating_basis"]["profile_id"] == profile_id
+                    assert result["rating_basis"]["loaded_conductors"] == 2
+                    assert result["inputs"]["insulation_exposure"] == exposure
+                    response = await session.call_tool("generate_calculation_report", request)
+                    assert not response.is_error
+                    report = response.content[0].text
+                    assert f"Rating profile identifier: {profile_id}" in report
+                    assert f"Rating insulation exposure: {exposure}" in report
+                    assert "Rating loaded conductors: 2" in report
+                    assert "Independent invented ratings for stdio profile tests." in report
+                    assert "Profile size coverage (mm2): [2.5, 4.0, 6.0]" in report
+
+                invalid = [
+                    arguments,  # Thermal flat cable needs an explicit exposure.
+                    {**arguments, "phase": "3phase", "insulation_exposure": "partially_surrounded"},
+                    {**arguments, "insulation": "X90", "insulation_exposure": "partially_surrounded"},
+                    {**arguments, "insulation_exposure": "none"},
+                    {**arguments, "cable_construction": "generic", "insulation_exposure": "partially_surrounded"},
+                ]
+                for request in invalid:
+                    response = await session.call_tool("size_cable", request)
+                    assert response.is_error, f"An unsupported profile silently fell back: {request}"
+                    assert response.content
+                generic = _json_result(await session.call_tool("size_cable", {
+                    "load": 20.0, "length_m": 5.0, "voltage": 230.0, "phase": "1phase",
+                    "installation_method": "in_thermal_insulation",
+                }))
+                assert generic["recommended_active_size_mm2"] == 10.0
+                assert generic["rating_basis"]["profile_id"] is None
+
+    asyncio.run(check_profiles())
 
 
 def test_stdio_missing_dataset_override_fails_without_using_bundled_data(tmp_path):

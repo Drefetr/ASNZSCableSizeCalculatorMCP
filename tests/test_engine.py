@@ -372,3 +372,162 @@ def test_provenance_is_result_snapshot():
     result = size_cable(63, 30)
     tables.DATA_PROVENANCE["assumptions"]["cable_construction"] = "Changed after result"
     assert result["data_provenance"]["assumptions"]["cable_construction"] != "Changed after result"
+
+
+def _install_flat_current_profiles(tmp_path, *, sizes=(2.5, 4, 6, 10), free_air=False):
+    """Add independently invented ampacity columns to the legacy test dataset."""
+    dataset = make_dataset()
+    dataset["schema_version"] = 2
+    profiles = {}
+    conditions = [
+        ("partially_surrounded", "in_thermal_insulation", 1.2),
+        ("completely_surrounded", "in_thermal_insulation", 0.8),
+    ]
+    if free_air:
+        conditions.append(("none", "unenclosed_in_air", 2.0))
+    for exposure, method, multiplier in conditions:
+        profiles[f"synthetic-flat-{exposure}"] = {
+            "cable_construction": "flat_2c_earth",
+            "conductor_material": "copper", "insulation": "V90", "loaded_conductors": 2,
+            "installation_method": method, "insulation_exposure": exposure,
+            "reference_temperature_c": 40,
+            "source": "Independent artificial test formula: multiplier * (4 * area + 1).",
+            "ratings": {str(size): multiplier * (4 * size + 1) for size in sizes},
+        }
+    dataset["tables"]["CURRENT_RATING_PROFILES"] = profiles
+    path = tmp_path / "synthetic-flat-profiles.json"
+    path.write_text(json.dumps(dataset), encoding="utf-8")
+    tables.load_dataset(path)
+    return profiles
+
+
+def _flat_request(exposure, **overrides):
+    return {
+        "load": 20, "length_m": 20, "voltage": 230, "phase": "1phase",
+        "installation_method": "in_thermal_insulation", "cable_construction": "flat_2c_earth",
+        "insulation_exposure": exposure, **overrides,
+    }
+
+
+@pytest.mark.parametrize("exposure,expected_size,multiplier", [
+    ("partially_surrounded", 4, 1.2), ("completely_surrounded", 6, 0.8),
+])
+def test_flat_two_loaded_conductor_profiles_select_the_matching_ampacity_column(
+    tmp_path, exposure, expected_size, multiplier,
+):
+    profiles = _install_flat_current_profiles(tmp_path)
+    result = size_cable(**_flat_request(exposure))
+    assert result["status"] == "success"
+    assert result["recommended_active_size_mm2"] == expected_size
+    assert result["cable_continuous_capacity_iz_a"] == pytest.approx(multiplier * (4 * expected_size + 1))
+    assert result["limiting_factor"] == "current_capacity"
+    assert result["voltage_drop_pct_raw"] < 3
+    assert result["inputs"]["cable_construction"] == "flat_2c_earth"
+    assert result["inputs"]["loaded_conductors"] == 2
+    assert result["inputs"]["insulation_exposure"] == exposure
+    basis = result["rating_basis"]
+    assert basis["profile_id"] == f"synthetic-flat-{exposure}"
+    assert basis["source"] == profiles[basis["profile_id"]]["source"]
+    assert basis["supported_sizes_mm2"] == [2.5, 4, 6, 10]
+    assert [candidate["size_mm2"] for candidate in result["all_candidates"]] == basis["supported_sizes_mm2"]
+    assert all(candidate["current_ok"] is False for candidate in result["all_candidates"]
+               if candidate["size_mm2"] < expected_size)
+
+    # Opting into a flat profile must not replace the existing generic column.
+    generic = size_cable(20, 20, voltage=230, phase="1phase", installation_method="in_thermal_insulation")
+    assert generic["recommended_active_size_mm2"] == 10
+    assert generic["inputs"]["cable_construction"] == "generic"
+    assert generic["rating_basis"]["profile_id"] is None
+
+
+@pytest.mark.parametrize("exposure,expected_size,multiplier", [
+    ("partially_surrounded", 6, 1.2), ("completely_surrounded", 10, 0.8),
+])
+def test_flat_profile_applies_ambient_and_grouping_derating_once(
+    tmp_path, exposure, expected_size, multiplier,
+):
+    _install_flat_current_profiles(tmp_path)
+    result = size_cable(**_flat_request(exposure, ambient_temp_c=45, num_circuits=2))
+    assert result["status"] == "success"
+    assert result["recommended_active_size_mm2"] == expected_size
+    expected_factor = 0.9 * 0.8
+    assert result["derating"]["total_derating_factor_raw"] == pytest.approx(expected_factor)
+    selected = next(candidate for candidate in result["all_candidates"] if candidate["size_mm2"] == expected_size)
+    assert selected["base_capacity_a"] == pytest.approx(multiplier * (4 * expected_size + 1))
+    assert selected["derated_capacity_a_raw"] == pytest.approx(selected["base_capacity_a"] * expected_factor)
+    assert selected["current_ok"] is True
+
+
+def test_flat_profile_voltage_drop_can_require_a_larger_profile_candidate(tmp_path):
+    _install_flat_current_profiles(tmp_path)
+    result = size_cable(**_flat_request("partially_surrounded", length_m=40))
+    assert result["recommended_active_size_mm2"] == 6
+    assert result["limiting_factor"] == "voltage_drop"
+    earlier = next(candidate for candidate in result["all_candidates"] if candidate["size_mm2"] == 4)
+    assert earlier["current_ok"] is True
+    assert earlier["voltage_drop_ok"] is False
+    assert earlier["failed_constraints"] == ["voltage_drop"]
+
+
+def test_sparse_flat_profile_never_uses_generic_ratings_for_missing_sizes(tmp_path):
+    _install_flat_current_profiles(tmp_path, sizes=(2.5, 6, 10))
+    result = size_cable(**_flat_request("partially_surrounded"))
+    assert result["recommended_active_size_mm2"] == 6
+    assert result["rating_basis"]["supported_sizes_mm2"] == [2.5, 6, 10]
+    assert [candidate["size_mm2"] for candidate in result["all_candidates"]] == [2.5, 6, 10]
+    assert all(candidate["size_mm2"] != 4 for candidate in result["all_candidates"])
+
+
+def test_flat_profile_insufficient_coverage_returns_failed_selection(tmp_path):
+    _install_flat_current_profiles(tmp_path, sizes=(2.5, 4))
+    result = size_cable(**_flat_request("partially_surrounded", load=30, length_m=1))
+    assert result["status"] == "failed"
+    assert result["recommended_active_size_mm2"] is None
+    assert result["recommended_earth_size_mm2"] is None
+    assert result["check_states"]["current_capacity"] == "no_selection"
+    assert result["rating_basis"]["supported_sizes_mm2"] == [2.5, 4]
+    assert [candidate["size_mm2"] for candidate in result["all_candidates"]] == [2.5, 4]
+    assert all(candidate["failed_constraints"] == ["current_capacity"] for candidate in result["all_candidates"])
+    assert "profile" in result["message"].lower()
+    assert "coverage" in result["message"].lower()
+
+
+@pytest.mark.parametrize("overrides", [
+    {"phase": "3phase"}, {"insulation_exposure": None},
+    {"cable_construction": "generic"}, {"cable_construction": "unknown"},
+    {"cable_construction": None}, {"cable_construction": True},
+    {"insulation_exposure": "none"}, {"insulation_exposure": "unknown"},
+    {"insulation_exposure": True}, {"conductor_material": "aluminium"},
+    {"insulation": "X90"}, {"installation_method": "in_conduit_in_air", "insulation_exposure": "none"},
+])
+def test_flat_profile_rejects_incompatible_or_unavailable_conditions(tmp_path, overrides):
+    _install_flat_current_profiles(tmp_path)
+    with pytest.raises(ValueError):
+        size_cable(**_flat_request("partially_surrounded", **overrides))
+
+
+@pytest.mark.parametrize("exposure", [None, "none"])
+def test_flat_unenclosed_profile_uses_explicit_no_insulation_condition(tmp_path, exposure):
+    _install_flat_current_profiles(tmp_path, free_air=True)
+    result = size_cable(**_flat_request(exposure, installation_method="unenclosed_in_air"))
+    assert result["status"] == "success"
+    assert result["recommended_active_size_mm2"] == 2.5
+    assert result["inputs"]["insulation_exposure"] == "none"
+    assert result["rating_basis"]["profile_id"] == "synthetic-flat-none"
+
+
+def test_legacy_dataset_flat_request_fails_instead_of_using_generic_column():
+    assert tables.CURRENT_RATING_PROFILES == {}
+    with pytest.raises(ValueError, match="(?i)profile"):
+        size_cable(**_flat_request("partially_surrounded"))
+
+
+def test_selected_profile_basis_is_a_result_snapshot(tmp_path):
+    _install_flat_current_profiles(tmp_path)
+    result = size_cable(**_flat_request("partially_surrounded"))
+    profile = tables.CURRENT_RATING_PROFILES["synthetic-flat-partially_surrounded"]
+    original_source = profile["source"]
+    profile["source"] = "Changed after calculation"
+    profile["ratings"].clear()
+    assert result["rating_basis"]["source"] == original_source
+    assert result["rating_basis"]["supported_sizes_mm2"] == [2.5, 4, 6, 10]

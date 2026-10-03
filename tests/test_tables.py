@@ -22,6 +22,119 @@ def test_bundled_and_independent_synthetic_data_are_valid():
     assert bundled["metadata"]["validation_status"] == "unverified"
 
 
+def profile_dataset():
+    """Use the deliberately sparse supplied columns to test schema contracts."""
+    return json.loads(Path(tables.__file__).with_name("reference_data.json").read_text())
+
+
+def test_profile_validation_preserves_sparse_ratings_and_legacy_columns():
+    raw = profile_dataset()
+    validated, _ = tables._validate(raw)
+    partial = validated["CURRENT_RATING_PROFILES"]["flat_2c_earth_partially_surrounded"]
+    assert partial["ratings"] == {2.5: 17, 4: 23}
+    assert partial["loaded_conductors"] == 2
+    assert partial["reference_temperature_c"] == 40
+    assert validated["CURRENT_RATINGS"]["copper"]["V90"]["in_thermal_insulation"][6] == 18
+
+
+@pytest.mark.parametrize("damage", [
+    "missing_field", "unknown_field", "empty_id", "unknown_construction", "unknown_material",
+    "unknown_insulation", "three_loaded_conductors", "boolean_loaded_conductors",
+    "fractional_loaded_conductors", "unknown_method", "missing_thermal_exposure",
+    "exposure_without_thermal_insulation", "missing_source", "wrong_reference", "nonfinite_reference",
+    "oversized_reference", "empty_ratings", "zero_rating", "negative_rating", "nonfinite_rating",
+    "oversized_rating", "decreasing_ratings", "unknown_size", "duplicate_numeric_size",
+    "duplicate_profile_conditions", "profiles_not_object",
+])
+def test_invalid_profiles_leave_all_loaded_tables_unchanged(tmp_path, damage):
+    raw = profile_dataset()
+    profiles = raw["tables"]["CURRENT_RATING_PROFILES"]
+    profile = profiles["flat_2c_earth_partially_surrounded"]
+    if damage == "missing_field":
+        del profile["source"]
+    elif damage == "unknown_field":
+        profile["extra"] = "not supported"
+    elif damage == "empty_id":
+        profiles[" "] = profiles.pop("flat_2c_earth_partially_surrounded")
+    elif damage == "unknown_construction":
+        profile["cable_construction"] = "circular_multicore"
+    elif damage == "unknown_material":
+        profile["conductor_material"] = "steel"
+    elif damage == "unknown_insulation":
+        profile["insulation"] = "V75"
+    elif damage == "three_loaded_conductors":
+        profile["loaded_conductors"] = 3
+    elif damage == "boolean_loaded_conductors":
+        profile["loaded_conductors"] = True
+    elif damage == "fractional_loaded_conductors":
+        profile["loaded_conductors"] = 2.0
+    elif damage == "unknown_method":
+        profile["installation_method"] = "unknown"
+    elif damage == "missing_thermal_exposure":
+        profile["insulation_exposure"] = "none"
+    elif damage == "exposure_without_thermal_insulation":
+        profile["installation_method"] = "unenclosed_in_air"
+    elif damage == "missing_source":
+        profile["source"] = " "
+    elif damage == "wrong_reference":
+        profile["reference_temperature_c"] = 35
+    elif damage == "nonfinite_reference":
+        profile["reference_temperature_c"] = float("nan")
+    elif damage == "oversized_reference":
+        profile["reference_temperature_c"] = 10 ** 1000
+    elif damage == "empty_ratings":
+        profile["ratings"] = {}
+    elif damage == "zero_rating":
+        profile["ratings"]["2.5"] = 0
+    elif damage == "negative_rating":
+        profile["ratings"]["2.5"] = -1
+    elif damage == "nonfinite_rating":
+        profile["ratings"]["2.5"] = float("inf")
+    elif damage == "oversized_rating":
+        profile["ratings"]["2.5"] = 10 ** 1000
+    elif damage == "decreasing_ratings":
+        profile["ratings"]["2.5"] = 24
+    elif damage == "unknown_size":
+        profile["ratings"]["3"] = 19
+    elif damage == "duplicate_numeric_size":
+        profile["ratings"]["2.50"] = 17
+    elif damage == "duplicate_profile_conditions":
+        profiles["duplicate"] = copy.deepcopy(profile)
+    elif damage == "profiles_not_object":
+        raw["tables"]["CURRENT_RATING_PROFILES"] = []
+
+    before = {name: copy.deepcopy(getattr(tables, name)) for name in tables._TABLE_NAMES}
+    provenance = copy.deepcopy(tables.DATA_PROVENANCE)
+    path = tmp_path / "bad-profiles.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="profile|PROFILE"):
+        tables.load_dataset(path)
+    assert {name: getattr(tables, name) for name in tables._TABLE_NAMES} == before
+    assert tables.DATA_PROVENANCE == provenance
+    tables.require_dataset()
+
+
+def test_loading_legacy_dataset_clears_profiles_without_replacing_imported_reference(tmp_path):
+    reference = tables.CURRENT_RATING_PROFILES
+    synthetic_path = os.environ["CABLESIZE_DATA_FILE"]
+    try:
+        tables.load_dataset(Path(tables.__file__).with_name("reference_data.json"))
+        assert len(reference) == 3
+        legacy = make_dataset()
+        legacy["schema_version"] = 1
+        legacy["tables"].pop("CURRENT_RATING_PROFILES", None)
+        path = tmp_path / "legacy.json"
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+        validated, _ = tables._validate(legacy)
+        assert validated["CURRENT_RATING_PROFILES"] == {}
+        tables.load_dataset(path)
+        assert tables.CURRENT_RATING_PROFILES is reference
+        assert reference == {}
+        assert tables.DATA_PROVENANCE["dataset_id"] == legacy["metadata"]["dataset_id"]
+    finally:
+        tables.load_dataset(synthetic_path)
+
+
 @pytest.fixture
 def bundled_dataset():
     synthetic_path = os.environ["CABLESIZE_DATA_FILE"]
@@ -31,6 +144,38 @@ def bundled_dataset():
         yield
     finally:
         tables.load_dataset(synthetic_path)
+
+
+@pytest.mark.parametrize("method,exposure,expected_size,expected_rating", [
+    ("in_thermal_insulation", "partially_surrounded", 4, 23),
+    ("in_thermal_insulation", "completely_surrounded", 6, 22),
+    ("unenclosed_in_air", "none", 2.5, 23),
+])
+def test_bundled_flat_tps_20a_circuit_matches_supplied_comparison(
+    bundled_dataset, method, exposure, expected_size, expected_rating,
+):
+    result = size_cable(
+        20, 20, voltage=230, phase="1phase", conductor_material="copper", insulation="V90",
+        installation_method=method, cable_construction="flat_2c_earth", insulation_exposure=exposure,
+        mcb_rating_amps=20, max_volt_drop_pct=3,
+    )
+
+    assert result["status"] == "success"
+    assert result["recommended_active_size_mm2"] == expected_size
+    selected = next(candidate for candidate in result["all_candidates"] if candidate["size_mm2"] == expected_size)
+    assert selected["base_capacity_a"] == expected_rating
+    assert selected["current_ok"] is True
+    assert selected["voltage_drop_ok"] is True
+    assert selected["pass_loop_impedance"] is True
+
+
+def test_bundled_legacy_generic_insulation_rating_is_unchanged(bundled_dataset):
+    result = size_cable(
+        20, 20, voltage=230, phase="1phase", installation_method="in_thermal_insulation",
+        mcb_rating_amps=20,
+    )
+    assert result["status"] == "success"
+    assert result["recommended_active_size_mm2"] == 10
 
 
 @pytest.mark.parametrize("curve,trip_current,maximum_impedance,passing_length,failing_length", [

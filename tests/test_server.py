@@ -6,7 +6,7 @@ from unittest.mock import Mock
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from cablesizecalculator import server
+from cablesizecalculator import server, tables
 from cablesizecalculator.report import format_calculation_report
 from cablesizecalculator.server import (
     calculate_derating,
@@ -40,6 +40,92 @@ def test_metadata_identifies_model_and_avoids_table_redistribution():
     assert "standard_earth_sizes_table_5_1" not in info
     assert "copper_sizes_mm2" not in info
     assert "aluminium_sizes_mm2" not in info
+    assert info["current_rating_profiles"] == []
+
+
+@pytest.fixture
+def artificial_flat_profiles(monkeypatch):
+    # Independently invented ratings exercise profile routing, not cable design.
+    common = {
+        "cable_construction": "flat_2c_earth", "conductor_material": "copper",
+        "insulation": "V90", "loaded_conductors": 2,
+        "installation_method": "in_thermal_insulation", "reference_temperature_c": 40.0,
+        "source": "Independent artificial profile for server tests.",
+    }
+    profiles = {
+        "synthetic_flat_partial": {
+            **common, "insulation_exposure": "partially_surrounded",
+            "ratings": {2.5: 12.0, 4.0: 24.0, 6.0: 32.0},
+        },
+        "synthetic_flat_complete": {
+            **common, "insulation_exposure": "completely_surrounded",
+            "ratings": {2.5: 9.0, 4.0: 17.0, 6.0: 25.0},
+        },
+    }
+    monkeypatch.setattr(tables, "CURRENT_RATING_PROFILES", profiles)
+    monkeypatch.setattr(server, "CURRENT_RATING_PROFILES", profiles)
+    return profiles
+
+
+def test_profile_metadata_exposes_conditions_and_coverage_only(artificial_flat_profiles):
+    artificial_flat_profiles["synthetic_flat_partial"]["private_extra"] = "Excluded metadata"
+    profiles = get_standards_info()["current_rating_profiles"]
+    partial = next(profile for profile in profiles if profile["profile_id"] == "synthetic_flat_partial")
+    assert partial == {
+        "profile_id": "synthetic_flat_partial", "supported_sizes_mm2": [2.5, 4.0, 6.0],
+        "cable_construction": "flat_2c_earth", "conductor_material": "copper",
+        "insulation": "V90", "loaded_conductors": 2,
+        "installation_method": "in_thermal_insulation", "reference_temperature_c": 40.0,
+        "source": "Independent artificial profile for server tests.",
+        "insulation_exposure": "partially_surrounded",
+    }
+    assert all("ratings" not in profile and "private_extra" not in profile for profile in profiles)
+
+
+@pytest.mark.parametrize("exposure,expected_size,profile_id", [
+    ("partially_surrounded", 4.0, "synthetic_flat_partial"),
+    ("completely_surrounded", 6.0, "synthetic_flat_complete"),
+])
+def test_sizing_and_report_expose_selected_profile(artificial_flat_profiles, exposure, expected_size, profile_id):
+    arguments = {
+        "load": 20, "length_m": 5, "voltage": 230, "phase": "1phase",
+        "installation_method": "in_thermal_insulation", "cable_construction": "flat_2c_earth",
+        "insulation_exposure": exposure,
+    }
+    result = size_cable(**arguments)
+    assert result["recommended_active_size_mm2"] == expected_size
+    assert result["inputs"]["loaded_conductors"] == 2
+    assert result["rating_basis"]["profile_id"] == profile_id
+    report = generate_calculation_report(**arguments)
+    for text in (
+        "Requested cable construction: flat_2c_earth", "Circuit loaded conductors: 2",
+        f"Thermal insulation exposure: {exposure}", f"Rating profile identifier: {profile_id}",
+        "Rated cable construction: flat_2c_earth", "Rating loaded conductors: 2",
+        "Rating reference temperature (C): 40", "Profile size coverage (mm2): [2.5, 4.0, 6.0]",
+        "Rating source: Independent artificial profile for server tests.",
+    ):
+        assert text in report
+    assert "Legacy generic rating column" not in report
+
+
+@pytest.mark.parametrize("overrides", [
+    {"insulation_exposure": None},
+    {"phase": "3phase"},
+    {"conductor_material": "aluminium"},
+    {"insulation": "X90"},
+    {"installation_method": "in_conduit_in_air", "insulation_exposure": "none"},
+    {"cable_construction": "generic"},
+])
+def test_profile_arguments_fail_without_generic_fallback(artificial_flat_profiles, overrides):
+    arguments = {
+        "load": 20, "length_m": 5, "phase": "1phase", "voltage": 230,
+        "installation_method": "in_thermal_insulation", "cable_construction": "flat_2c_earth",
+        "insulation_exposure": "partially_surrounded",
+    }
+    with pytest.raises(ToolError):
+        size_cable(**{**arguments, **overrides})
+    with pytest.raises(ToolError):
+        generate_calculation_report(**{**arguments, **overrides})
 
 
 def test_sizing_passes_requested_checks_and_marks_omissions():
@@ -72,6 +158,8 @@ def test_report_distinguishes_not_checked_from_passed():
     selected_row = next(line for line in report.splitlines() if line.endswith("SELECTED"))
     assert [column.strip() for column in selected_row.split("|")[6:9]] == ["--", "--", "--"]
     assert report.isascii()
+    assert "Legacy generic rating column: physical cable construction and loaded-conductor basis unspecified." in report
+    assert "Rating loaded conductors: unspecified" in report
 
 
 def test_report_shows_separate_active_and_earth_fault_conditions():

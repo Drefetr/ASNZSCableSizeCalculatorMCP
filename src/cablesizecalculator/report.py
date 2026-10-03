@@ -64,6 +64,9 @@ def format_calculation_report(
         "voltage": "Nominal voltage (V)", "phase": "Phase arrangement",
         "power_factor": "Load power factor", "conductor_material": "Active conductor material",
         "earth_conductor_material": "Earth conductor material", "insulation": "Insulation model",
+        "cable_construction": "Requested cable construction",
+        "loaded_conductors": "Circuit loaded conductors",
+        "insulation_exposure": "Thermal insulation exposure",
         "installation_method": "Installation model", "ambient_temp_c": "Air/soil temperature (C)",
         "num_circuits": "Grouped circuit count", "depth_m": "Burial depth (m)",
         "max_volt_drop_pct": "Voltage-drop limit (%)", "mcb_rating_amps": "MCB rating (A)",
@@ -84,6 +87,21 @@ def format_calculation_report(
         assumptions = [assumptions]
     for assumption in assumptions:
         lines.append(f"  * Assumption: {assumption}")
+    lines.extend(["", " CURRENT-RATING BASIS", subseparator])
+    rating_basis = result.get("rating_basis", {})
+    if not rating_basis.get("profile_id"):
+        lines.append("  * Legacy generic rating column: physical cable construction and loaded-conductor basis unspecified.")
+    for key, label in (
+        ("profile_id", "Rating profile identifier"), ("source", "Rating source"),
+        ("cable_construction", "Rated cable construction"),
+        ("loaded_conductors", "Rating loaded conductors"),
+        ("insulation_exposure", "Rating insulation exposure"),
+        ("reference_temperature_c", "Rating reference temperature (C)"),
+        ("supported_sizes_mm2", "Profile size coverage (mm2)"),
+    ):
+        if key in rating_basis:
+            value = "unspecified" if rating_basis[key] is None else rating_basis[key]
+            lines.append(f"  * {label}: {value}")
     lines.extend(["", " 2. MODEL CHECK STATUS", subseparator])
 
     states = result.get("check_states", {})

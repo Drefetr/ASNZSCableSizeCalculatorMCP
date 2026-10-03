@@ -16,7 +16,7 @@ from cablesizecalculator.engine import (
     get_derating_factor,
     size_cable as engine_size_cable,
 )
-from cablesizecalculator.tables import DATA_PROVENANCE
+from cablesizecalculator.tables import CURRENT_RATING_PROFILES, DATA_PROVENANCE
 
 # Schema constraints protect MCP callers; the engine independently validates direct calls.
 PositiveNumber = Annotated[float, Field(gt=0, allow_inf_nan=False, strict=True)]
@@ -32,6 +32,8 @@ Material = Literal["copper", "aluminium"]
 Insulation = Literal["V90", "X90"]
 LoadUnit = Literal["A", "kW", "kVA", "hp"]
 Curve = Literal["B", "C", "D"]
+CableConstruction = Literal["generic", "flat_2c_earth"]
+InsulationExposure = Literal["none", "partially_surrounded", "completely_surrounded"]
 Installation = Literal[
     "in_conduit_in_air", "unenclosed_in_air", "in_thermal_insulation",
     "underground_duct", "buried_direct",
@@ -105,6 +107,8 @@ def size_cable(
     earth_fault_current_ka: PositiveNumber | None = None,
     earth_fault_time_s: ClearingTime | None = None,
     supply_loop_impedance_ohm: NonNegativeNumber = 0.0,
+    cable_construction: CableConstruction = "generic",
+    insulation_exposure: InsulationExposure | None = None,
 ) -> dict[str, Any]:
     """Select the smallest candidate passing all requested experimental model checks.
 
@@ -124,6 +128,12 @@ def size_cable(
     Earth fault overrides require check_fault=True.
     Omitted fault checks are reported as not requested. The earth material is independent
     of the active material. An experimental selection is not an installation approval.
+    cable_construction="flat_2c_earth" selects a dedicated two-loaded-conductor profile
+    and requires phase="1phase". For in_thermal_insulation, explicitly choose
+    partially_surrounded or completely_surrounded; unenclosed_in_air uses none.
+    Unsupported construction/condition combinations are rejected without generic fallback.
+    The generic default preserves the existing dataset column and does not identify a
+    physical cable construction or insulation exposure.
     """
     return _call_engine(
         engine_size_cable,
@@ -136,6 +146,7 @@ def size_cable(
         fault_time_s=fault_time_s, earth_conductor_material=earth_conductor_material,
         earth_fault_current_ka=earth_fault_current_ka, earth_fault_time_s=earth_fault_time_s,
         supply_loop_impedance_ohm=supply_loop_impedance_ohm,
+        cable_construction=cable_construction, insulation_exposure=insulation_exposure,
     )
 
 
@@ -263,6 +274,22 @@ def get_standards_info() -> dict[str, Any]:
             "in_conduit_in_air", "unenclosed_in_air", "in_thermal_insulation",
             "underground_duct", "buried_direct",
         ],
+        "current_rating_profiles": [
+            {
+                "profile_id": profile_id,
+                "supported_sizes_mm2": sorted(profile["ratings"]),
+                **{
+                    key: profile[key]
+                    for key in (
+                        "source", "cable_construction", "conductor_material", "insulation",
+                        "loaded_conductors", "installation_method", "insulation_exposure",
+                        "reference_temperature_c",
+                    )
+                    if key in profile
+                },
+            }
+            for profile_id, profile in CURRENT_RATING_PROFILES.items()
+        ],
         "assumptions": [
             "AC calculations only; DC data has not been independently validated.",
             "Cable construction, loaded conductors, grouping geometry and soil resistivity require dataset-specific validation.",
@@ -297,6 +324,8 @@ def generate_calculation_report(
     earth_fault_current_ka: PositiveNumber | None = None,
     earth_fault_time_s: ClearingTime | None = None,
     supply_loop_impedance_ohm: NonNegativeNumber = 0.0,
+    cable_construction: CableConstruction = "generic",
+    insulation_exposure: InsulationExposure | None = None,
 ) -> str:
     """Generate an ASCII report of inputs, assumptions and requested experimental checks.
 
@@ -315,6 +344,7 @@ def generate_calculation_report(
         fault_time_s=fault_time_s, earth_conductor_material=earth_conductor_material,
         earth_fault_current_ka=earth_fault_current_ka, earth_fault_time_s=earth_fault_time_s,
         supply_loop_impedance_ohm=supply_loop_impedance_ohm,
+        cable_construction=cable_construction, insulation_exposure=insulation_exposure,
     )
     return format_calculation_report(result)
 

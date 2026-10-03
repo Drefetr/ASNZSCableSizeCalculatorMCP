@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "metadata": {
     "dataset_id": "bundled-reference-data-v1",
     "source": "Legacy repository tables; exact source editions and columns are not recorded.",
@@ -645,6 +645,50 @@
       "aluminium": {
         "V90": 73.0,
         "X90": 94.0
+      }
+    },
+    "CURRENT_RATING_PROFILES": {
+      "flat_2c_earth_partially_surrounded": {
+        "cable_construction": "flat_2c_earth",
+        "conductor_material": "copper",
+        "insulation": "V90",
+        "loaded_conductors": 2,
+        "installation_method": "in_thermal_insulation",
+        "insulation_exposure": "partially_surrounded",
+        "reference_temperature_c": 40,
+        "source": "Supplied JCalc comparison; conservative lower bounds of the supplied rating ranges.",
+        "ratings": {
+          "2.5": 17.0,
+          "4.0": 23.0
+        }
+      },
+      "flat_2c_earth_completely_surrounded": {
+        "cable_construction": "flat_2c_earth",
+        "conductor_material": "copper",
+        "insulation": "V90",
+        "loaded_conductors": 2,
+        "installation_method": "in_thermal_insulation",
+        "insulation_exposure": "completely_surrounded",
+        "reference_temperature_c": 40,
+        "source": "Supplied JCalc comparison; conservative lower bounds of the supplied rating ranges.",
+        "ratings": {
+          "2.5": 13.0,
+          "4.0": 18.0,
+          "6.0": 22.0
+        }
+      },
+      "flat_2c_earth_unenclosed_in_air": {
+        "cable_construction": "flat_2c_earth",
+        "conductor_material": "copper",
+        "insulation": "V90",
+        "loaded_conductors": 2,
+        "installation_method": "unenclosed_in_air",
+        "insulation_exposure": "none",
+        "reference_temperature_c": 40,
+        "source": "Supplied JCalc comparison; conservative lower bounds of the supplied rating ranges.",
+        "ratings": {
+          "2.5": 23.0
+        }
       }
     }
   }

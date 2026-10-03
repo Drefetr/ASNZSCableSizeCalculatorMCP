@@ -9,6 +9,8 @@ INSTALLATION_METHODS = (
     "in_conduit_in_air", "unenclosed_in_air", "in_thermal_insulation",
     "underground_duct", "buried_direct",
 )
+CABLE_CONSTRUCTIONS = ("generic", "flat_2c_earth")
+INSULATION_EXPOSURES = ("none", "partially_surrounded", "completely_surrounded")
 
 
 def finite_number(value: float, name: str, *, minimum: float | None = None,

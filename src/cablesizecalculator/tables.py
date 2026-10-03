@@ -24,6 +24,7 @@ TABLE_5_1_EARTH: dict[float, float] = {}
 RESISTANCE_TABLE: dict[str, dict[str, dict[float, float]]] = {}
 REACTANCE_TABLE: dict[float, float] = {}
 CURRENT_RATINGS: dict[str, dict[str, dict[str, dict[float, float]]]] = {}
+CURRENT_RATING_PROFILES: dict[str, dict[str, Any]] = {}
 TEMP_DERATING_AIR: dict[str, dict[float, float]] = {}
 TEMP_DERATING_GROUND: dict[str, dict[float, float]] = {}
 CIRCUITS_GROUPING_DERATING: dict[int, float] = {}
@@ -37,12 +38,13 @@ DATA_PROVENANCE: dict[str, Any] = {
     "distribution": "Bundled data is unverified; local reference data can override it.",
 }
 _DATA_ERROR: str | None = None
-_TABLE_NAMES = (
+_LEGACY_TABLE_NAMES = (
     "CONDUCTOR_SIZES_COPPER", "CONDUCTOR_SIZES_ALUMINIUM", "TABLE_5_1_EARTH",
     "RESISTANCE_TABLE", "REACTANCE_TABLE", "CURRENT_RATINGS", "TEMP_DERATING_AIR",
     "TEMP_DERATING_GROUND", "CIRCUITS_GROUPING_DERATING", "DEPTH_DERATING_GROUND",
     "ADIABATIC_K_FACTORS", "MCB_TRIP_MULTIPLIERS",
 )
+_TABLE_NAMES = _LEGACY_TABLE_NAMES + ("CURRENT_RATING_PROFILES",)
 
 
 def _number(value: Any, label: str, *, zero: bool = False) -> float:
@@ -114,10 +116,78 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict:
     return result
 
 
+def _current_rating_profiles(
+    raw: Any, sizes: dict[str, list[float]], resistance: dict,
+    reactance: dict, assumptions: dict,
+) -> dict[str, dict[str, Any]]:
+    """Validate explicit, possibly sparse ampacity columns without inferring ratings."""
+    if not isinstance(raw, dict):
+        raise ValueError("CURRENT_RATING_PROFILES must be an object.")
+    result = {}
+    combinations = set()
+    fields = (
+        "cable_construction", "conductor_material", "insulation", "loaded_conductors",
+        "installation_method", "insulation_exposure", "reference_temperature_c", "source", "ratings",
+    )
+    for profile_id, raw_profile in raw.items():
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            raise ValueError("Current rating profile identifiers must be non-empty strings.")
+        label = f"CURRENT_RATING_PROFILES.{profile_id}"
+        profile = _object(raw_profile, label, fields)
+        if profile["cable_construction"] != "flat_2c_earth":
+            raise ValueError(f"{label} has an unsupported cable construction.")
+        material = profile["conductor_material"]
+        insulation = profile["insulation"]
+        method = profile["installation_method"]
+        if material not in MATERIALS or insulation not in INSULATIONS:
+            raise ValueError(f"{label} has an unsupported conductor material or insulation.")
+        if type(profile["loaded_conductors"]) is not int or profile["loaded_conductors"] != 2:
+            raise ValueError(f"{label} requires exactly two loaded conductors for flat 2C+E cable.")
+        if method not in INSTALLATION_METHODS:
+            raise ValueError(f"{label} has an unsupported installation method.")
+        exposure = profile["insulation_exposure"]
+        permitted_exposures = (
+            ("partially_surrounded", "completely_surrounded")
+            if method == "in_thermal_insulation" else ("none",)
+        )
+        if exposure not in permitted_exposures:
+            raise ValueError(f"{label} has incompatible installation method and insulation exposure.")
+        reference = profile["reference_temperature_c"]
+        if isinstance(reference, bool) or not isinstance(reference, (int, float)):
+            raise ValueError(f"{label}.reference_temperature_c must be finite.")
+        try:
+            reference = float(reference)
+        except OverflowError:
+            raise ValueError(f"{label}.reference_temperature_c exceeds the supported numerical range.") from None
+        reference_key = (
+            "reference_ground_temp_c" if method in ("underground_duct", "buried_direct")
+            else "reference_air_temp_c"
+        )
+        if not math.isfinite(reference) or reference != assumptions[reference_key]:
+            raise ValueError(f"{label}.reference_temperature_c must match the declared derating reference.")
+        if not isinstance(profile["source"], str) or not profile["source"].strip():
+            raise ValueError(f"{label}.source must be a non-empty string.")
+        ratings = _numeric_map(profile["ratings"], f"{label}.ratings")
+        if any(size not in sizes[material] or size not in resistance[material][insulation]
+               or size not in reactance for size in ratings):
+            raise ValueError(f"{label}.ratings must use sizes with configured conductor and impedance data.")
+        if any(a > b for a, b in zip(ratings.values(), list(ratings.values())[1:])):
+            raise ValueError(f"{label}.ratings must not decrease with conductor size.")
+        combination = (
+            profile["cable_construction"], material, insulation, profile["loaded_conductors"], method, exposure,
+        )
+        if combination in combinations:
+            raise ValueError("CURRENT_RATING_PROFILES contains duplicate cable conditions.")
+        combinations.add(combination)
+        result[profile_id] = dict(profile, reference_temperature_c=reference, ratings=ratings)
+    return result
+
+
 def _validate(raw: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     _object(raw, "dataset", ("schema_version", "metadata", "tables"))
-    if isinstance(raw["schema_version"], bool) or raw["schema_version"] != 1:
-        raise ValueError("Unsupported reference data schema_version; expected 1.")
+    version = raw["schema_version"]
+    if isinstance(version, bool) or version not in (1, 2):
+        raise ValueError("Unsupported reference data schema_version; expected 1 or 2.")
     metadata = _object(raw["metadata"], "metadata", (
         "dataset_id", "source", "licence", "standard_editions", "validation_status", "assumptions",
     ))
@@ -153,7 +223,7 @@ def _validate(raw: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         if not isinstance(assumptions[key], str) or not assumptions[key].strip():
             raise ValueError(f"metadata.assumptions.{key} must document the dataset conditions.")
 
-    tables = _object(raw["tables"], "tables", _TABLE_NAMES)
+    tables = _object(raw["tables"], "tables", _LEGACY_TABLE_NAMES if version == 1 else _TABLE_NAMES)
     result: dict[str, Any] = {}
     sizes = {}
     for material, name in zip(MATERIALS, ("CONDUCTOR_SIZES_COPPER", "CONDUCTOR_SIZES_ALUMINIUM")):
@@ -220,6 +290,11 @@ def _validate(raw: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         curve: _number(value, "MCB_TRIP_MULTIPLIERS")
         for curve, value in _object(tables["MCB_TRIP_MULTIPLIERS"], "MCB_TRIP_MULTIPLIERS", ("B", "C", "D")).items()
     }
+    result["CURRENT_RATING_PROFILES"] = (
+        _current_rating_profiles(
+            tables["CURRENT_RATING_PROFILES"], sizes, resistance, result["REACTANCE_TABLE"], assumptions,
+        ) if version == 2 else {}
+    )
     return result, metadata
 
 

@@ -45,6 +45,64 @@ def _reactance(size: float) -> float:
     return _lookup(tables.REACTANCE_TABLE, size, "Reactance for conductor size (mm2)")
 
 
+def _current_rating_basis(
+    material: str, insulation: str, method: str, phase: str,
+    construction: str, exposure: str | None,
+) -> tuple[dict[float, float], dict[str, Any], str]:
+    """Select only ratings whose declared cable and installation conditions match."""
+    if exposure is None:
+        if method == "in_thermal_insulation":
+            if construction != "generic":
+                raise ValueError("insulation_exposure is required for flat_2c_earth in thermal insulation; use partially_surrounded or completely_surrounded.")
+            exposure = "unspecified"
+        else:
+            exposure = "none"
+    else:
+        exposure = validate.choice(exposure, "insulation_exposure", validate.INSULATION_EXPOSURES)
+        if method == "in_thermal_insulation" and exposure == "none":
+            raise ValueError("in_thermal_insulation requires partially_surrounded or completely_surrounded exposure.")
+        if method != "in_thermal_insulation" and exposure != "none":
+            raise ValueError("partially_surrounded and completely_surrounded require installation_method='in_thermal_insulation'.")
+
+    if construction == "generic":
+        if exposure in ("partially_surrounded", "completely_surrounded"):
+            raise ValueError("The generic current-rating table does not distinguish insulation exposure; select a supported cable_construction profile.")
+        ratings = _lookup(_lookup(_lookup(tables.CURRENT_RATINGS, material, "Material"),
+                                  insulation, "Insulation"), method, "Installation method")
+        assumptions = tables.DATA_PROVENANCE["assumptions"]
+        reference = "reference_ground_temp_c" if method in ("underground_duct", "buried_direct") else "reference_air_temp_c"
+        return ratings, {
+            "profile_id": None, "source": tables.DATA_PROVENANCE["source"],
+            "cable_construction": "generic", "loaded_conductors": None,
+            "insulation_exposure": exposure, "reference_temperature_c": assumptions[reference],
+            "supported_sizes_mm2": sorted(ratings),
+        }, exposure
+
+    if phase != "1phase":
+        raise ValueError("flat_2c_earth requires phase='1phase' with two loaded conductors.")
+    for profile_id, profile in tables.CURRENT_RATING_PROFILES.items():
+        if (
+            profile["cable_construction"] == construction
+            and profile["conductor_material"] == material
+            and profile["insulation"] == insulation
+            and profile["loaded_conductors"] == 2
+            and profile["installation_method"] == method
+            and profile["insulation_exposure"] == exposure
+        ):
+            return profile["ratings"], {
+                "profile_id": profile_id,
+                **{key: profile[key] for key in (
+                    "source", "cable_construction", "loaded_conductors", "insulation_exposure",
+                    "reference_temperature_c",
+                )},
+                "supported_sizes_mm2": sorted(profile["ratings"]),
+            }, exposure
+    raise ValueError(
+        "No current-rating profile is configured for "
+        f"{construction}, {material}, {insulation}, two loaded conductors, {method}, {exposure}."
+    )
+
+
 def calculate_load_current(
     load: float, unit: str = "A", voltage: float = 400.0,
     phase: str = "3phase", power_factor: float = 0.85,
@@ -251,6 +309,7 @@ def size_cable(
     check_fault: bool = False, fault_current_ka: float = 6.0, fault_time_s: float = 0.1,
     earth_conductor_material: str = "copper", earth_fault_current_ka: float | None = None,
     earth_fault_time_s: float | None = None, supply_loop_impedance_ohm: float = 0.0,
+    cable_construction: str = "generic", insulation_exposure: str | None = None,
 ) -> dict[str, Any]:
     """Select the smallest active size passing all requested calculations.
 
@@ -263,6 +322,7 @@ def size_cable(
     material, earth_material = validate.material(conductor_material), validate.material(earth_conductor_material)
     insulation, phase = validate.insulation(insulation), validate.ac_phase(phase)
     method = validate.choice(installation_method, "installation method", validate.INSTALLATION_METHODS)
+    construction = validate.choice(cable_construction, "cable_construction", validate.CABLE_CONSTRUCTIONS)
     unit = validate.choice(unit, "unit", ("a", "kw", "kva", "hp"))
     load = validate.finite_number(load, "load", positive=True)
     voltage = validate.finite_number(voltage, "voltage", positive=True)
@@ -284,10 +344,12 @@ def size_cable(
         raise ValueError("supply_loop_impedance_ohm requires mcb_rating_amps to evaluate disconnection.")
     if rating is not None and rating < ib:
         raise ValueError("mcb_rating_amps must be at least the design load current.")
+    ratings, rating_basis, exposure = _current_rating_basis(
+        material, insulation, method, phase, construction, insulation_exposure,
+    )
     derating = get_derating_factor(ambient_temp_c, method, num_circuits, depth_m, insulation)
     factor = derating["total_derating_factor_raw"]
-    sizes = tables.CONDUCTOR_SIZES_COPPER if material == "copper" else tables.CONDUCTOR_SIZES_ALUMINIUM
-    ratings = _lookup(_lookup(_lookup(tables.CURRENT_RATINGS, material, "Material"), insulation, "Insulation"), method, "Installation method")
+    sizes = sorted(ratings)
     if not sizes:
         raise ValueError("No conductor sizes are configured.")
     required = ib if rating is None else rating
@@ -352,6 +414,8 @@ def size_cable(
         "load": load, "unit": unit, "length_m": length, "voltage": voltage, "phase": phase, "power_factor": pf,
         "conductor_material": material, "earth_conductor_material": earth_material, "insulation": insulation,
         "installation_method": method, "ambient_temp_c": derating["ambient_temp_c"],
+        "cable_construction": construction, "loaded_conductors": 2 if phase == "1phase" else 3,
+        "insulation_exposure": exposure,
         "num_circuits": validate.circuit_count(num_circuits), "depth_m": float(depth_m),
         "max_volt_drop_pct": limit, "mcb_rating_amps": rating, "mcb_curve": curve, "check_fault": fault,
         "fault_current_ka": fault_current, "fault_time_s": fault_time, "earth_fault_current_ka": earth_current,
@@ -368,9 +432,17 @@ def size_cable(
         assumptions.append(f"Source loop magnitude is {source} ohm; source and cable magnitudes are added. Trip current uses the configured curve multiplier and 0.8 voltage factor.")
     if fault:
         assumptions.append("Earth fault current/time default to active fault conditions unless separately supplied; verify with the actual protective device.")
+    if rating_basis["profile_id"] is not None:
+        assumptions.append("The selected profile specifies current capacity; impedance, earth pairings and thermal withstand use the dataset's other configured tables.")
+    else:
+        assumptions.append("Legacy generic current ratings do not distinguish cable construction, loaded conductors or detailed insulation exposure.")
     result = {
         "status": "failed" if selected is None else "success",
-        "message": "No configured cable size satisfied all requested calculations." if selected is None else None,
+        "message": (
+            "No configured cable size within the selected current-rating profile coverage satisfied all requested calculations."
+            if rating_basis["profile_id"] is not None else
+            "No configured cable size satisfied all requested calculations."
+        ) if selected is None else None,
         "recommended_active_size_mm2": None, "recommended_earth_size_mm2": None,
         "earth_conductor_material": earth_material, "limiting_factor": None,
         "design_current_ib_a": round(ib, 2), "required_rating_a": round(required, 2),
@@ -379,7 +451,7 @@ def size_cable(
         "voltage_drop_limit_pct": limit, "derating": derating, "loop_impedance_check": None,
         "short_circuit_check": None, "earth_short_circuit_check": None,
         "check_states": states, "inputs": inputs, "assumptions": assumptions, "all_candidates": evaluations,
-        "data_provenance": _provenance(),
+        "data_provenance": _provenance(), "rating_basis": deepcopy(rating_basis),
     }
     if selected is None:
         return result
